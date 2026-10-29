@@ -1,0 +1,1116 @@
+---
+title: "Q2 - Cluster Analysis"
+author: "Group-2"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Load Libraries
+
+```{r}
+library(tidyverse)
+library(psych)
+library(psychTools)
+library(corrplot)
+library(cluster)     
+library(factoextra)  
+```
+
+***
+# Load and Prepare Data
+
+```{r}
+# Load data
+data <- read_csv("early_2012_2013_loan_sample_with_outcome.csv")
+
+# Convert subgrade to numeric (A1=1, A2=2, ..., G5=35)
+subgrade_levels <- c("A1","A2","A3","A4","A5",
+                     "B1","B2","B3","B4","B5",
+                     "C1","C2","C3","C4","C5",
+                     "D1","D2","D3","D4","D5",
+                     "E1","E2","E3","E4","E5",
+                     "F1","F2","F3","F4","F5",
+                     "G1","G2","G3","G4","G5")
+
+data$sub_grade_numeric <- as.numeric(factor(data$sub_grade, 
+                                            levels = subgrade_levels,
+                                            ordered = TRUE))
+
+# Convert term to numeric (36 or 60)
+data$term_numeric <- as.numeric(gsub("[^0-9]", "", data$term))
+
+# Convert revol_util from "13.4%" to 13.4
+data$revol_util <- as.numeric(gsub("%", "", data$revol_util))
+```
+
+***
+
+# Select Variables for Analysis
+
+```{r}
+# Define 11 clustering variables
+clustering_vars <- c(
+  "annual_inc", "dti", "revol_util",
+  "sub_grade_numeric", "delinq_2yrs", "inq_last_6mths", 
+  "open_acc", "total_acc",
+  "funded_amnt", "int_rate", "term_numeric"
+)
+
+# Extract these variables and remove missing values
+pca_data <- data %>%
+  select(all_of(clustering_vars)) %>%
+  na.omit()
+
+cat("Sample size:", nrow(pca_data), "borrowers\n")
+cat("Number of variables:", ncol(pca_data), "\n")
+```
+
+We selected 11 variables because they represent the key borrower and loan features needed for segmentation: income and debt-to-income reflect affordability, revolving utilisation and account counts reflect credit usage, delinquencies and recent inquiries reflect credit risk behaviour, and loan amount/interest rate/term capture the loan’s pricing and structure. After removing missing values, we retained 49,969 borrowers with complete data across all 11 variables, which gives a large enough sample for stable PCA and clustering.
+
+```{r}
+# Evidence check: pub_rec suitability for PCA (one-off diagnostic)
+# Temporary PCA input that includes pub_rec
+clustering_vars_with_pubrec <- c(clustering_vars, "pub_rec")
+
+pca_data_with_pubrec <- data %>%
+  select(all_of(clustering_vars_with_pubrec)) %>%
+  na.omit()
+
+# KMO variable-level MSAs
+kmo_with_pubrec <- KMO(pca_data_with_pubrec)
+
+msa_table <- tibble(
+  variable = names(kmo_with_pubrec$MSAi),
+  MSA = as.numeric(kmo_with_pubrec$MSAi)
+) %>%
+  arrange(MSA)
+
+# Overall KMO (with pub_rec) 
+round(kmo_with_pubrec$MSA, 3)         
+msa_table %>% print(n = Inf)           
+```
+
+Note on pub_rec (excluded from PCA inputs):
+We initially included pub_rec because it captures serious adverse credit events (public records). When we ran the PCA suitability checks with pub_rec included, the overall KMO was 0.627, which is acceptable for proceeding with PCA. However, the variable-level MSA for pub_rec was very low (≈ 0.33), well below the typical minimum threshold of ~0.50. This indicates pub_rec does not share enough common variance with the rest of the underwriting variables and would weaken the shared factor structure that PCA is trying to summarise. We therefore excluded pub_rec from the PCA/clustering inputs, but reintroduced it later for cluster profiling so we can still report whether certain segments show higher public-record incidence.
+
+***
+# Outlier Removal
+
+```{r}
+# Standardise the variables (z-scores)
+pca_scaled <- scale(pca_data)
+
+# Mahalanobis distance (multivariate distance from the mean profile)
+Maha <- mahalanobis(pca_scaled,
+                    center = colMeans(pca_scaled),
+                    cov = cov(pca_scaled))
+
+# Convert distance to p-values (Chi-square, df = number of variables)
+df_maha <- ncol(pca_scaled) 
+MahaPvalue <- pchisq(Maha, df = df_maha, lower.tail = FALSE)
+
+# Threshold for outliers
+alpha <- 0.001
+
+# How many outliers?
+n_outliers <- sum(MahaPvalue < alpha)
+cat("\nOutliers flagged (p < ", alpha, "): ", n_outliers, "\n", sep = "")
+
+# see the extreme cases
+outlier_table <- tibble(Maha = Maha, MahaPvalue = MahaPvalue) %>%
+  arrange(MahaPvalue)
+
+print(head(outlier_table, 12))
+
+# inspect actual variable values for the worst 5 outliers
+worst_idx <- as.integer(rownames(outlier_table)[1:5])
+print(pca_data[worst_idx, ])
+
+# Remove outliers
+keep_idx <- MahaPvalue >= alpha
+pca_data <- pca_data[keep_idx, , drop = FALSE]
+
+cat("Rows after outlier removal:", nrow(pca_data), "\n")
+
+# Align outcome (loan_is_bad) to the exact same rows used for PCA/clustering
+keep_complete <- complete.cases(data[, clustering_vars])   
+loan_is_bad_clean <- data$loan_is_bad[keep_complete][keep_idx]
+
+# Clean up
+rm(pca_scaled, Maha, MahaPvalue, outlier_table, n_outliers, df_maha, alpha, worst_idx)
+```
+
+We standardised the 11 variables (converted them to z-scores) so that large-scale variables like income do not dominate the distance calculation. We then used Mahalanobis distance to measure how “unusual” each borrower is compared to the overall multivariate average profile, taking all 11 variables together. Converting these distances to Chi-square p-values and using a strict rule of p < 0.001, we flagged 1,071 borrowers as multivariate outliers. After removing them, the dataset size reduced from 49,969 to 48,898, meaning about 2.1% of cases were removed. This helps PCA and clustering because extreme profiles can pull the PCA directions and distort distance-based clustering.
+
+***
+
+# Describe the Data
+
+```{r}
+describe(pca_data)
+```
+
+```{r}
+headTail(pca_data)
+```
+
+```{r}
+# Check Assumptions
+
+str(pca_data)
+
+# Non numeric columns
+non_numeric <- names(pca_data)[!sapply(pca_data, is.numeric)]
+non_numeric
+
+pca_matrix <- cor(pca_data)
+```
+
+```{r}
+round(pca_matrix, 2)
+```
+
+The correlation matrix shows a few clear relationships between our borrower variables. The strongest is sub_grade_numeric vs int_rate (0.99), meaning credit subgrade and interest rate are almost measuring the same thing (high multicollinearity). We also see moderate links like open_acc vs total_acc (0.66) and funded_amnt vs annual_inc (0.45). Because some variables are strongly correlated, PCA is appropriate before clustering to avoid “double counting” the same information.
+
+```{r}
+lowerCor(pca_data)
+```
+
+This lower-triangle correlation table shows the same pattern as the full matrix showing sub_grade_numeric and int_rate are almost perfectly correlated (0.99), and there are a couple of other noticeable relationships like open_acc vs total_acc (0.66) and funded_amnt vs annual_inc (0.45). Overall, this confirms some variables overlap strongly, so using PCA before clustering is sensible.
+
+## Visualize Correlation Matrix
+
+```{r}
+corrplot(pca_matrix, 
+         method = "color",
+         type = "upper",
+         tl.col = "black",
+         tl.srt = 45,
+         addCoef.col = "black",
+         number.cex = 0.6,
+         title = "Correlation Matrix",
+         mar = c(0,0,2,0))
+```
+
+## Kaiser-Meyer-Olkin (KMO) Test
+
+```{r}
+KMO(pca_data)
+```
+
+The KMO test gives an overall MSA of 0.61, which is acceptable and suggests the data is suitable enough for PCA (it’s above 0.5, but not “strong”). Most variables are around 0.56–0.77, which is fine, but a few are borderline/weak such as annual_inc (0.49) and delinq_2yrs (0.48), meaning those variables share less common structure with the others.
+
+## Bartlett's Test of Sphericity
+
+Tests whether correlation matrix is significantly different from identity matrix. Looking for p < 0.05.
+
+```{r}
+cortest.bartlett(pca_data)
+```
+
+Bartlett’s test is significant (p ≈ 0), so we reject the idea that the variables are unrelated. This means the correlation matrix is not just random noise, the variables do share common patterns. So it makes sense to use PCA on this dataset.
+
+***
+
+# Perform PCA
+
+Extract all possible principal components (11 components for 11 variables).
+
+```{r}
+# number of variables (max components)
+p <- ncol(pca_data)
+
+pc_model <- principal(pca_data,
+                      nfactors = p,
+                      rotate = "none",
+                      weights = TRUE,
+                      scores = TRUE)
+print(pc_model)
+```
+
+The Cumulative Var shows that the first few components capture most of the variation in the data: PC1–PC6 explain about 85%, PC1–PC7 explain about 90%, and PC1–PC8 explain about 94%. So, using the 90% rule we would keep 7 principal components as it is the first point where cumulative variance reaches ~0.90.
+
+The loadings show that PC1 is strongly driven by sub_grade_numeric and int_rate, which matches what we saw in the correlation matrix. This means PC1 is largely capturing a credit-risk / pricing pattern in the data.
+
+## Display Loadings (Sorted)
+
+Show only loadings above 0.3 and sort by size.
+
+```{r}
+print.psych(pc_model, cut = 0.3, sort = TRUE)
+```
+
+This output shows which original variables belong most to each principal component by listing only loadings above 0.30. The clearest pattern is that PC1 is dominated by sub_grade_numeric and int_rate, meaning the first component is mainly capturing the borrower’s risk/price level (worse subgrade goes with higher interest rate). PC2 is mainly driven by open_acc and total_acc, so it represents a borrower’s credit account volume. We also see other components picking up separate patterns such as DTI (PC3), recent inquiries (PC4) and delinquencies (PC5), which suggests PCA is separating different aspects of borrower behaviour into different dimensions. The variance section confirms that keeping PC1–PC7 reaches about 90% cumulative variance, so 7 PCs meets the 90% threshold.
+
+***
+
+# Scree Plot - Determine Number of Components
+
+The scree plot shows eigenvalues for each component. Look for the "elbow" where eigenvalues level off.
+
+```{r}
+plot(pc_model$values, 
+     type = "b",
+     xlab = "Component Number",
+     ylab = "Eigenvalue",
+     main = "Scree Plot")
+abline(h = 1, col = "red", lty = 2)
+grid()
+```
+
+Based on our aim, we are not using the scree plot to pick the “elbow” or the eigenvalue>1 cut-off. Our goal is to keep enough principal components to retain around 90% of the total variance, because we want to cluster on uncorrelated inputs (PC scores) while still keeping most of the information from the original borrower variables. From our variance table, the cumulative variance reaches about 90% by PC7, so we keep PC1–PC7. Even though the scree plot suggests that only the first ~5 components have eigenvalues above 1, stopping at 5 would leave us below our 90% target. Keeping 7 PCs is therefore a better match for our purpose: it reduces multicollinearity (PCs are uncorrelated) and still preserves most of the original variation needed for meaningful borrower segmentation.
+
+## Variance Explained
+
+```{r}
+eigenvalues <- pc_model$values
+variance_pct <- (eigenvalues / sum(eigenvalues)) * 100
+cumulative_var <- cumsum(variance_pct)
+
+variance_table <- data.frame(
+  Component = 1:length(eigenvalues),
+  Eigenvalue = round(eigenvalues, 2),
+  Variance_Pct = round(variance_pct, 2),
+  Cumulative_Pct = round(cumulative_var, 2)
+)
+
+print(variance_table)
+```
+
+PC1 is the most important on its own because it explains 26.74% of the total variation. When we add PC2, the cumulative explained variance increases to 44.63%, and adding PC3 brings it to 57.67%. By the time we reach PC7, the cumulative variance is 90.33%, which meets our target of keeping at least 90% of the original information.
+
+So, for our purpose (cluster analysis with reduced multicollinearity), we would keep the first 7 PCs (PC1–PC7) and drop PC8–PC11, because those remaining PCs only add a small amount of extra information (about 9.7% in total after PC7) and are less important for the clustering step.
+
+```{r}
+# Components needed to explain at least 90% variance
+threshold <- 90
+n_components_90 <- which(cumulative_var >= threshold)[1]
+
+cat("\nComponents needed for", threshold, "% variance:", n_components_90, "\n")
+cat("These explain", round(cumulative_var[n_components_90], 2), "% of total variance\n")
+```
+
+***
+
+# Extract Component Scores
+
+Component scores show where each borrower falls on each principal component.
+
+## Beta Weights
+
+Beta weights are used to calculate component scores from the data.
+
+```{r}
+pc_model$weights
+```
+
+The weights table shows the formula R uses to calculate each borrower’s PC scores from the original 11 variables. Bigger weights (in absolute value) mean that variable contributes more to that PC, and the sign (+/–) shows the direction. Here, PC1 is mainly driven by risk/pricing and loan size variables (e.g., sub_grade_numeric, int_rate, funded_amnt, term), while PC2 is mainly driven by credit account counts (open_acc and total_acc). Since we keep PCs up to the 90% variance threshold, we focus on the weights for PC1–PC7 because those are the components used for clustering.
+
+## Component Scores
+
+```{r}
+head(pc_model$scores, 8)
+```
+
+This output shows the PC scores for the first 8 borrowers. Each number is that borrower’s position on a principal component, where scores are centred around 0: positive values mean the borrower is above average on that component’s pattern, and negative values mean they are below average. These scores are what we take forward into clustering (we will keep only PC1–PC7 because that meets our 90% variance rule), so each borrower will be grouped based on how similar their PC score profiles are.
+
+## Add Scores to Dataset
+
+```{r}
+scores_for_clustering <- as.data.frame(pc_model$scores)[, 1:n_components_90, drop = FALSE]
+pca_data_with_scores <- cbind(pca_data, scores_for_clustering)
+headTail(pca_data_with_scores)
+```
+
+This final table confirms that we have successfully attached the retained PC scores (PC1–PC7) to each borrower’s original variables in one dataset. Each borrower now has their raw values (income, DTI, subgrade, etc.) plus their PC scores, which are the uncorrelated inputs we will use for clustering. From this point, the cluster analysis will be run on PC1–PC7 only (to meet the 90% variance rule), while the original variables remain in the dataset so we can profile and interpret what each cluster looks like in real borrower terms.
+
+***
+
+# Summary and Conclusions
+
+```{r}
+cat("PCA SUMMARY (FOR CLUSTER ANALYSIS)\n\n")
+cat("Sample size used for PCA:", nrow(pca_data), "borrowers\n")
+cat("Variables analyzed:", ncol(pca_data), "\n\n")
+
+# KMO once (avoid running KMO() multiple times)
+kmo_val <- KMO(pca_data)$MSA
+cat("KMO Measure of Sampling Adequacy:", round(kmo_val, 3), "\n")
+if(kmo_val > 0.7) {
+  cat("  - Data suitable for PCA (KMO > 0.7)\n\n")
+} else if(kmo_val > 0.5) {
+  cat("  - Data acceptable for PCA (KMO > 0.5)\n\n")
+} else {
+  cat("  - WARNING: Data may not be suitable for PCA (KMO < 0.5)\n\n")
+}
+
+# 90% variance decision rule
+cat("Decision rule: retain the minimum number of PCs with cumulative variance >= ", threshold, "%\n", sep="")
+cat("Number of PCs retained:", n_components_90, "\n")
+cat("Variance explained by retained PCs:", round(cumulative_var[n_components_90], 2), "%\n\n")
+
+cat("RECOMMENDATION for CLUSTER ANALYSIS (Q2):\n")
+cat("  - Use the first", n_components_90, "PC scores (PC1 to PC", n_components_90, ") as clustering inputs\n", sep=" ")
+cat("  - Rationale: PC scores are uncorrelated and retain >= ", threshold, "% of the information in the original variables\n", sep="")
+```
+
+***
+
+# Save results for cluster
+
+```{r}
+# Save PCA outputs for Q2 Cluster Analysis
+pca_results <- list(
+  n_components_90 = n_components_90,
+  threshold = threshold,
+  pc_model = pc_model,
+  pca_data = pca_data,
+  clustering_vars = clustering_vars,
+  eigenvalues = eigenvalues,
+  variance_explained = variance_pct,
+  cumulative_variance = cumulative_var,
+  scores_for_clustering = as.data.frame(pc_model$scores)[, 1:n_components_90, drop = FALSE],
+  keep_idx_outliers = keep_idx,
+  loan_is_bad_clean = loan_is_bad_clean
+)
+```
+
+***
+
+# Cluster Analysis - LendingClub Loan Data
+
+## Load PCA results saved from PCA section
+
+```{r}
+
+# Number of PCs retained (>= 90% variance rule)
+pca_results$n_components_90
+
+# PC scores to cluster on
+scores_for_clustering <- pca_results$scores_for_clustering
+
+# Rename columns consistently
+colnames(scores_for_clustering) <- paste0("PC", 1:ncol(scores_for_clustering))
+
+cat("Rows in PCA score dataset:", nrow(scores_for_clustering), "\n")
+cat("PCs used for clustering:", ncol(scores_for_clustering), "\n")
+```
+
+We load the saved PCA results (pca_results.rds) so the clustering stage uses the same cleaned sample and PCA transformation. The PCA stage retained 7 PCs , so borrowers will be clustered using the uncorrelated PC scores (PC1–PC7) rather than the original correlated variables. After cleaning and outlier removal in PCA, the clustering dataset contains 48,898 borrowers and 7 PC features.
+
+***
+
+We are clustering **borrowers (cases/objects)**, so we describe the PCA-score dataset.
+
+```{r}
+describe(scores_for_clustering)
+```
+The PC score dataset looks well-prepared for clustering: all 48,898 borrowers have PC1–PC7 scores with means close to 0 and standard deviations around 1, which is expected. Most PCs are fairly balanced, but PC5 stands out as more skewed and heavy-tailed, meaning a small number of borrowers take extreme values on that dimension. Overall, the PC score data is suitable to move into clustering
+
+```{r}
+headTail(scores_for_clustering)
+```
+
+
+```{r}
+X <- scale(scores_for_clustering)
+headTail(X)
+```
+
+We standardise the PC scores using scale(), so each PC is on the same scale before calculating distances for clustering. The headTail output confirms the dataset still has the same 7 PC columns and borrower rows, just in standardised form.
+
+***
+
+# Hierarchical Cluster Analysis
+
+## Find the linkage method to use
+
+```{r}
+# Linkage method selection (use a SAMPLE for hierarchical diagnostics)
+
+set.seed(55)
+
+# Sample for hierarchical clustering diagnostics
+n_total <- nrow(X)
+n_hc <- min(3000, n_total)
+idx_hc <- sample(1:n_total, size = n_hc, replace = FALSE)
+
+X_hc <- X[idx_hc, , drop = FALSE]
+
+# Compare linkage methods using agglomerative coefficient
+m <- c("average", "single", "complete", "ward")
+names(m) <- m
+
+ac <- function(method_name) {
+  agnes(X_hc, method = method_name)$ac
+}
+
+ac_values <- sapply(m, ac)
+ac_values
+
+best_linkage <- names(which.max(ac_values))
+cat("Best linkage:", best_linkage, "\n")
+```
+
+We take a random sample of 3,000 borrowers (with a fixed seed so it’s repeatable) and compare different hierarchical linkage methods using the agglomerative coefficient, where higher values indicate a clearer clustering structure. Here, Ward’s method has the highest coefficient (0.988), so it is the most suitable linkage option among those tested for the hierarchical diagnostics stage.
+
+## Fit hierarchical clustering model
+
+We use Euclidean distance (standard with Ward / k-means style clustering).
+
+```{r}
+# Hierarchical clustering
+
+# distance matrix for the sampled data
+distance_mat <- dist(X_hc, method = "euclidean")
+
+# hclust uses ward.D2 for Ward
+hc_method <- ifelse(best_linkage == "ward", "ward.D2", best_linkage)
+
+Hierar_cl <- hclust(distance_mat, method = hc_method)
+Hierar_cl
+```
+
+Here we run hierarchical clustering on the 3,000-sample using Euclidean distance and Ward’s linkage (ward.D2 in hclust). The output confirms the settings used (Ward.D2 + Euclidean) and that the hierarchical model was built on 3,000 borrowers, which is the sampled subset used for the diagnostics.
+
+Plot dendrogram
+
+```{r}
+plot(Hierar_cl,
+     labels = FALSE,
+     hang = -1,
+     main = paste0("Hierarchical clustering dendrogram (", hc_method, ", sample n=", nrow(X_hc), ")"),
+     xlab = "Borrowers",
+     ylab = "Merge height (dissimilarity)",
+     sub = "")
+
+#Dendogram filtered to make it clearer
+library(dendextend)
+
+cut_h <- 15
+
+dend <- as.dendrogram(Hierar_cl)
+
+# keep only the structure above the cutoff
+dend_top <- cut(dend, h = cut_h)$upper
+
+# remove any labels completely
+dend_top <- set(dend_top, "labels", rep("", nleaves(dend_top)))
+
+plot(dend_top,
+     main = paste0("Hierarchical clustering dendrogram (", hc_method, ", sample n=", nrow(X_hc), ")"),
+     ylab = "Merge height (dissimilarity)",
+     xlab = "Borrowers",
+     sub = "")
+```
+
+The dendrogram (Ward.D2 on a 3,000-sample) is visually dense due to the number of observations, so we use it mainly as a supporting visual and rely on elbow and silhouette plots to choose the number of clusters.
+
+***
+
+# Choosing number of clusters (k)
+
+We use two diagnostics
+1) **Elbow** method (WCSS)  
+2) **Silhouette** method (mean silhouette width)
+
+## Elbow method (WCSS) for hierarchical clustering
+
+```{r}
+wcss_hclust <- function(k, hc, X) {
+  clusters <- cutree(hc, k = k)
+  total <- 0
+  for (g in unique(clusters)) {
+    Xg <- X[clusters == g, , drop = FALSE]
+    total <- total + sum(scale(Xg, center = TRUE, scale = FALSE)^2)
+  }
+  total
+}
+
+Kmax <- 10
+
+wcss <- numeric(Kmax)
+for (k in 1:Kmax) wcss[k] <- wcss_hclust(k, hc = Hierar_cl, X = X_hc)
+
+plot(1:Kmax, wcss, type = "b",
+     xlab = "Number of clusters (k)",
+     ylab = "Total WCSS",
+     main = "Elbow method for hierarchical clustering")
+grid()
+```
+
+The elbow plot shows that the total within-cluster variation (WCSS) drops quickly as we increase k from 1 to about 3–4, and then the improvements become smaller after that. The bend in the curve is around k = 4, which suggests that using more than 4 clusters gives diminishing returns in terms of reducing within-cluster variation.
+
+## Silhouette method for hierarchical clustering
+
+```{r}
+sil <- numeric(Kmax)
+sil[1] <- NA
+
+for (k in 2:Kmax) {
+  cl <- cutree(Hierar_cl, k = k)
+ sil[k] <- mean(silhouette(cl, dist(X_hc))[, 3])
+}
+
+plot(2:Kmax, sil[2:Kmax], type = "b",
+     xlab = "k",
+     ylab = "Mean silhouette width",
+     main = "Silhouette vs k (hierarchical clustering)")
+grid()
+
+best_k_sil <- which.max(sil)
+cat("Best k by mean silhouette (hierarchical):", best_k_sil, "\n")
+```
+
+This silhouette plot measures how well-separated the clusters are, where higher values indicate clearer clustering. The highest silhouette value occurs at k = 2, meaning two clusters produce the clearest separation on this diagnostic, while silhouette scores drop as k increases. In practice we consider this alongside the elbow plot and interpretability, which is why we also assess solutions around k = 3–4 rather than relying on silhouette alone.
+
+```{r}
+# Compare k = 3 vs k = 4 using the same pipeline (HC seeds -> kmeans full data)
+
+run_k_pipeline <- function(k, Hierar_cl, X_hc, X, seed = 55) {
+  fit_hc_k <- cutree(Hierar_cl, k = k)
+  hcentres_k <- aggregate(
+    x = as.data.frame(X_hc),
+    by = list(cluster = fit_hc_k),
+    FUN = mean
+  )
+  init_centres_k <- as.matrix(hcentres_k[, -1, drop = FALSE])
+  set.seed(seed)
+  km_k <- kmeans(X, centers = init_centres_k, nstart = 25)
+  tibble(
+    k = k,
+    betweenSS_totalSS = km_k$betweenss / km_k$totss,
+    sizes = paste(sort(km_k$size), collapse = ", ")
+  )
+}
+
+k_compare <- bind_rows(
+  run_k_pipeline(3, Hierar_cl, X_hc, X),
+  run_k_pipeline(4, Hierar_cl, X_hc, X)
+)
+
+k_compare
+```
+This sensitivity check re-runs the same clustering pipeline for k = 3 and k = 4 (hierarchical cut on the 3,000-sample then compute centres and k-means on the full dataset) and compares separation using betweenSS/totalSS. The results show that k = 4 achieves materially stronger separation (0.296) than k = 3 (0.221), meaning a larger share of total variance is explained by differences between clusters rather than within clusters. In addition, the k = 3 solution produces one dominant “mainstream” cluster (33,873 borrowers) that absorbs multiple borrower types, whereas k = 4 splits this into more interpretable segments (26,673; 8,333; 8,163; 5,729). Taken together, this supports k = 4 as the more distinct and decision-useful segmentation.
+
+## Final k
+
+```{r}
+k_final <- 4
+cat("k_final used for reporting:", k_final, "\n")
+
+k_kmeans_final <- k_final
+```
+
+***
+
+# Cutting the tree + cluster centres (for seeding k-means)
+
+```{r}
+fit_hc <- cutree(Hierar_cl, k = k_final)
+table(fit_hc)
+
+final_data_hc <- as.data.frame(X_hc) %>%
+  mutate(cluster = fit_hc)
+
+# compute cluster centres (means) to use as initial seeds
+hcentres <- aggregate(x = final_data_hc[, colnames(final_data_hc) != "cluster"],
+                      by = list(cluster = fit_hc),
+                      FUN = mean)
+
+print(hcentres)
+
+# convert centres to matrix (drop cluster id column)
+init_centers <- as.matrix(hcentres[, -1, drop = FALSE])
+```
+
+After cutting the hierarchical dendrogram into 4 clusters, we calculate the average PC values for each cluster (the hcentres table), which summarises the typical PCA “profile” of each group in the sample. The centres show clear differences across components: Cluster 1 is strongly positive on PC1 and strongly negative on PC4–PC6, Cluster 2 is negative on PC1 with moderate positive PC3 and PC6 (and a negative PC4), Cluster 3 stands out with a strongly positive PC5 (and high PC4), and Cluster 4 has very high positive PC4 and PC7 with a strongly negative PC5. These centre patterns are then used as the starting centres for k-means on the full dataset so that k-means begins from meaningful group positions rather than random initial points.
+***
+
+# K-means clustering seeded by hierarchical centres (combination approach)
+
+```{r}
+set.seed(55)
+
+km_hc_init <- kmeans(X,
+                     centers = init_centers,
+                     nstart = 25)
+
+# sanity check: centres must have same number of columns as X
+stopifnot(ncol(init_centers) == ncol(X))
+
+stopifnot(nrow(init_centers) == k_final)
+```
+
+The k-means model (k = 4) produces four segments with sizes 26,673, 8,333, 8,163, and 5,729, so most borrowers fall into one large “mainstream” cluster and the rest are split into three smaller groups. The cluster means show clear differences in PC patterns: for example, Cluster 1 has a strongly positive PC1 and negative PC3/PC6 (a distinct profile), Cluster 3 stands out with a very high positive PC5, and Cluster 4 has high positive PC4 and PC7 with a positive PC6. The separation statistic (between_SS / total_SS = 29.6%) suggests a moderate level of clustering structure—there is meaningful segmentation, but some overlap between borrower types is still expected.
+
+***
+
+# K-means:Gap statistic to support choosing k
+
+Gap statistic compares within-cluster dispersion to what we would see if there were no real clusters.
+
+```{r}
+set.seed(123)
+
+gap_km <- clusGap(
+  X_hc,                
+  FUNcluster = kmeans,
+  K.max = 10,
+  B = 20,              
+  nstart = 25
+)
+
+fviz_gap_stat(gap_km)
+```
+
+The gap statistic compares clustering performance on the real data to clustering performance on random reference data. In our case it suggests k=1 and 2, meaning the data does not have very strong separation compared to a no-cluster baseline; therefore we treat it as a supporting diagnostic and rely more on elbow/silhouette and interpretability for selecting k.
+
+***
+
+# Final k-means model
+
+```{r}
+km_final <- km_hc_init
+table(km_final$cluster)
+```
+
+***
+
+# Profile cluster solution (interpretation)
+
+We interpret clusters using the original borrower variables  
+
+
+```{r}
+# cleaned dataset used in PCA/clustering
+pca_data_complete <- as.data.frame(pca_results$pca_data)
+
+# same row filters used in PCA so pub_rec lines up row-for-row
+clustering_vars <- pca_results$clustering_vars
+keep_complete <- complete.cases(data[, clustering_vars])
+keep_outliers <- pca_results$keep_idx_outliers
+
+pub_rec_clean <- data$pub_rec[keep_complete][keep_outliers]
+
+# sanity check: pub_rec must match the clustered rows
+stopifnot(length(pub_rec_clean) == nrow(pca_data_complete))
+
+# Attach cluster labels + pub_rec for profiling
+clustered_data <- pca_data_complete %>%
+  mutate(
+    pub_rec = pub_rec_clean,
+    cluster = factor(km_final$cluster)
+  )
+
+# Mean profile by cluster (now includes pub_rec)
+cluster_profile <- clustered_data %>%
+  group_by(cluster) %>%
+  summarise(across(everything(), ~ mean(.x, na.rm = TRUE)),
+            n = n(),
+            .groups = "drop")
+
+print(cluster_profile, n = Inf, width = Inf)
+```
+
+Cluster 1 (n = 8,333) is the “highest-cost / weakest credit” segment. It has the worst credit quality (sub_grade_numeric ≈ 17.6) and the highest interest rate (≈ 18.1%). It also has the largest funded amounts (≈ £22.4k) and the longest terms (term_numeric ≈ 59, meaning mostly 60-month loans). This profile is consistent with a higher-risk borrower group.
+
+Cluster 2 (n = 26,673) looks like the “mainstream / lower-risk” group. It has the best credit quality (lowest sub_grade_numeric ≈ 8.91), the lowest interest rate (≈ 12.4%), and zero delinquencies on average (delinq_2yrs = 0). Funded amounts are relatively smaller (≈ £11.8k) and the term is mostly 36 months.
+
+Cluster 3 (n = 5,729) is the “delinquency-history” segment. It is clearly separated by much higher delinq_2yrs (≈ 1.36) compared with the other clusters (near 0.00–0.11). Credit quality and interest rates are mid-range (sub_grade_numeric ≈ 11.4, int_rate ≈ 14.3%), but the delinquency history makes this group distinct.
+
+Cluster 4 (n = 8,163) is a “high-inquiry / active credit-seeking” segment. It stands out due to a much higher number of recent credit inquiries (inq_last_6mths ≈ 2.46), while delinquencies remain low (≈ 0.05). Credit quality and interest rates are mid-range (sub_grade_numeric ≈ 11.1, int_rate ≈ 14.1%), with moderate funded amounts (≈ £12.2k) and mostly 36-month terms.
+
+## Outcome / "bad rate" by cluster
+
+
+```{r}
+# Realised profit by cluster (Primary OEM)
+
+# Rebuild the same row filter used to create pca_data (complete cases + outlier removal)
+keep_complete <- complete.cases(data[, clustering_vars])   
+keep_non_outliers <- pca_results$keep_idx_outliers             
+
+# Create realised profit on the exact same rows 
+realised_profit_clean <- data %>%
+  filter(keep_complete) %>%
+  slice(which(keep_non_outliers)) %>%   # keep the same rows after outlier removal
+  transmute(
+    realised_profit =
+      total_rec_prncp +
+      total_rec_int +
+      total_rec_late_fee +
+      recoveries -
+      collection_recovery_fee -
+      funded_amnt
+  ) %>%
+  pull(realised_profit)
+
+stopifnot(length(realised_profit_clean) == nrow(clustered_data))
+
+# Summarise profit by cluster
+profit_by_cluster <- clustered_data %>%
+  mutate(realised_profit = realised_profit_clean) %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    mean_profit = mean(realised_profit, na.rm = TRUE),
+    median_profit = median(realised_profit, na.rm = TRUE),
+    total_profit = sum(realised_profit, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(cluster)
+
+profit_by_cluster
+
+# Visual: mean realised profit by cluster
+ggplot(profit_by_cluster, aes(x = cluster, y = mean_profit, fill = cluster)) +
+  geom_col() +
+  labs(
+    title = "Mean realised profit by cluster (OEM)",
+    x = "Cluster", y = "Mean realised profit"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+
+Using realised profit as our primary OEM, the k = 4 clustering produces financially distinct borrower segments. Cluster 1 is clearly the weakest segment on the OEM, with a negative mean profit (-£217) and a total realised profit of about -£1.81m. In contrast, Clusters 2, 3 and 4 are all value-generating, but at different levels: Cluster 2 is the main profit engine because it is the largest segment and delivers the highest total profit (≈ £31.83m), Cluster 3 has the strongest profit quality on a per-loan basis (highest mean and median profit), and Cluster 4 is profitable but lower margin than Clusters 2 and 3.
+
+Overall, this supports that the four clusters represent meaningfully different borrower types in terms of business value (not just statistical separation), which strengthens the justification for using k = 4 for segmentation.
+
+```{r}
+outcome_bad <- as.integer(tolower(as.character(pca_results$loan_is_bad_clean)) == "true")
+
+# Safety check: outcome length must match clustered_data rows
+stopifnot(length(outcome_bad) == nrow(clustered_data))
+
+outcome_by_cluster <- clustered_data %>%
+  mutate(outcome_bad = outcome_bad) %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    bad_n = sum(outcome_bad == 1),
+    good_n = sum(outcome_bad == 0),
+    bad_rate = mean(outcome_bad),
+    bad_pct = 100 * bad_n / n,   # percent of borrowers in cluster who are bad
+    .groups = "drop"
+  )
+
+outcome_by_cluster
+
+
+# Visual: bad-loan rate by cluster
+ggplot(outcome_by_cluster, aes(x = cluster, y = bad_rate, fill = cluster)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Bad-loan rate by cluster",
+    x = "Cluster", y = "Bad-loan rate"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+These results also show clear differences in observed risk across the four borrower segments. Cluster 1 has the highest bad-loan rate at 23.3% (1,939 bad out of 8,333), making it the highest-risk segment on this outcome measure. Cluster 4 is the next highest-risk group at 18.1% (1,475 out of 8,163), followed by Cluster 3 at 14.2% (816 out of 5,729). Cluster 2 has the lowest bad-loan rate at 12.5% (3,344 out of 26,673) and is also the largest cluster, indicating it captures the more “mainstream” borrower profile. This aligns with the cluster profiles: Cluster 1 has weaker credit quality (higher sub_grade_numeric), higher interest rates, larger loans and longer terms, while Cluster 2 has stronger credit quality and lower interest rates. Overall, the spread in bad-loan rates across clusters indicates meaningful risk segmentation, supporting our choice of k = 4.
+
+***
+
+# Stability check using random subsets
+
+A validation approach is used to cluster two random subsets and compare cluster profiles.  
+
+```{r}
+set.seed(2026)
+
+n <- nrow(X)
+idx1 <- sample(1:n, size = floor(0.5*n), replace = FALSE)
+idx2 <- setdiff(1:n, idx1)
+
+km_1 <- kmeans(X[idx1, ], centers = k_kmeans_final, nstart = 25)
+km_2 <- kmeans(X[idx2, ], centers = k_kmeans_final, nstart = 25)
+
+cat("Subset1 cluster sizes:\n"); print(table(km_1$cluster))
+cat("\nSubset2 cluster sizes:\n"); print(table(km_2$cluster))
+
+prof1 <- pca_data_complete[idx1, ] %>%
+  mutate(cluster = factor(km_1$cluster)) %>%
+  group_by(cluster) %>%
+  summarise(across(everything(), mean), n=n(), .groups="drop") %>%
+  arrange(sub_grade_numeric)   # sort for easier comparison
+
+prof2 <- pca_data_complete[idx2, ] %>%
+  mutate(cluster = factor(km_2$cluster)) %>%
+  group_by(cluster) %>%
+  summarise(across(everything(), mean), n=n(), .groups="drop") %>%
+  arrange(sub_grade_numeric)
+
+prof1
+prof2
+```
+
+This stability check suggests the 4-cluster solution is consistent when we rerun k-means on two random halves of the data. Although the cluster labels swap between subsets (which is normal in k-means), the same borrower “types” reappear with very similar averages. In both halves we see: a large “prime/lowest-rate” group (sub_grade ≈ 8.9, int_rate ≈ 12.4, term ≈ 36), a distinct “high-inquiry” group (inq_last_6mths ≈ 2.46–2.47 with mid subgrade ≈ 11.1), a “delinquency-history” group (delinq_2yrs ≈ 1.36–1.37 with subgrade ≈ 11.4–11.5), and a “weakest credit/highest cost” group (sub_grade ≈ 17.5–17.7, int_rate ≈ 18.1–18.2, term ≈ 59, and larger loan amounts ≈ £22.4k). The cluster sizes are also very similar across halves (roughly ~13.3k, ~4.1k, ~2.9k, and ~4.2k per half), which supports that the segmentation is not driven by random noise.
+
+```{r}
+# clustered_data has original variables + cluster labels
+cluster_means <- clustered_data %>%
+  group_by(cluster) %>%
+  summarise(across(where(is.numeric), mean), .groups="drop")
+
+# For each variable: max(mean) - min(mean) across clusters
+sig_strength <- cluster_means %>%
+  summarise(across(where(is.numeric), ~ max(.x) - min(.x))) %>%
+  pivot_longer(everything(), names_to="variable", values_to="spread") %>%
+  arrange(desc(spread))
+
+sig_strength
+```
+
+This table shows which borrower variables separate the clusters most by looking at the spread of cluster means (max minus min). The largest differences are in annual income (~£16k), funded amount (~£10.7k) and loan term (~22.9 months), so these are key drivers of segment separation. Credit-quality variables also differ meaningfully, especially sub_grade_numeric (~8.7) and interest rate (~5.7 percentage points). By contrast, pub_rec has almost no spread (~0.03), suggesting it does not vary much across clusters and is not a major driver of segmentation in this solution.
+
+
+We compared k=3 and k=4 using the same clustering workflow to check if the extra cluster under k=4 adds a meaningful borrower segment. The k=4 solution fits the data better in PCA space (between_SS/total_SS = 29.6% vs 22.1% for k=3) and separates risk and value more clearly. With k=4, we isolate a distinct “high inquiry / mid-risk” group (18.1% bad rate) that also has lower average realised profit (about £879) than the main low-risk cluster. Under k=3, this group gets merged into the large mainstream cluster, which pushes its bad rate up to 13.6% and mixes different profit profiles together. Because k=4 keeps these borrower types separate instead of averaging them, it gives clearer segments for interpreting policy performance, so we use k=4 as the final solution.
+
+***
+
+```{r}
+cluster_results <- list(
+  pc_scores_scaled = X,
+  hc_method = hc_method,
+  best_linkage = best_linkage,
+  k_final_hier = k_final,
+  hierarchical_clusters = fit_hc,
+  kmeans_final_k = k_kmeans_final,
+  kmeans_model = km_final,
+  cluster_profile = cluster_profile
+)
+```
+
+***
+#Policy Performance By cluster 
+
+```{r}
+
+# Rebuild the exact row filter used for PCA/clustering
+keep_complete <- complete.cases(data[, clustering_vars])  
+keep_outliers <- pca_results$keep_idx_outliers            
+
+# Pull the policy/outcome/profit columns from the original dataset
+df_q2c <- data[keep_complete, ] %>%
+  slice(which(keep_outliers)) %>% 
+  mutate(cluster = factor(km_final$cluster))
+
+# Safety check: rows must match
+stopifnot(nrow(df_q2c) == length(km_final$cluster))
+```
+***
+
+***
+#Policy Definitions and OEM + secpndary binary loan outcome (loan is bad)
+
+```{r}
+# binary loan outcome flag (used as a supporting risk check), TRUE if the loan ended badly (Charged Off or Default), otherwise FALSE
+#Calculate OEM / realised profit per borrower (our main evaluation metric)
+df_q2c <- df_q2c %>%
+  mutate(
+    loan_is_bad = loan_status %in% c("Charged Off", "Default"),
+
+    policy_a = grade %in% c("A", "B") & dti < 25,
+    policy_b = grade %in% c("A", "B", "C", "D") & dti < 25,
+
+    realised_profit =
+      total_rec_prncp +
+      total_rec_int +
+      total_rec_late_fee +
+      recoveries -
+      collection_recovery_fee -
+      funded_amnt
+  )
+```
+
+***
+
+***
+# Policy Comparison by borrower cluster
+```{r}
+# Converts policy_a and policy_b into a long format
+# Group the data by borrower cluster AND policy.
+policy_by_cluster <- df_q2c %>%
+  pivot_longer(c(policy_a, policy_b),
+               names_to = "policy",
+               values_to = "approved") %>%
+  group_by(cluster, policy) %>%
+  summarise(
+    n_total = n(),
+    n_approved = sum(approved, na.rm = TRUE),
+    approval_rate = n_approved / n_total,
+
+    mean_profit_approved = mean(realised_profit[approved], na.rm = TRUE),
+    median_profit_approved = median(realised_profit[approved], na.rm = TRUE),
+    total_profit_approved = sum(realised_profit[approved], na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  arrange(cluster, policy)
+
+policy_by_cluster
+```
+
+```{r}
+# Visual of Total realised profit from approved loans by cluster and policy
+
+
+policy_plot_profit <- policy_by_cluster %>%
+  mutate(
+    # force ordering + ensure all 4 clusters appear consistently
+    cluster = factor(cluster, levels = c("1","2","3","4")),
+    # rename policy labels for the legend (avoid recode() masking issues)
+    policy = dplyr::case_when(
+      policy == "policy_a" ~ "Policy A",
+      policy == "policy_b" ~ "Policy B",
+      TRUE ~ as.character(policy)
+    )
+  )
+
+ggplot(policy_plot_profit, aes(x = cluster, y = total_profit_approved, fill = policy)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  labs(
+    title = "Total realised profit from approved loans by cluster",
+    x = "Cluster",
+    y = "Total realised profit (£)",
+    fill = "Policy"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+This table compares Policy A vs Policy B within each borrower cluster using realised profit (our OEM). Policy B has a much higher approval rate in every cluster, which is expected because it allows grades A–D instead of only A–B. However, clustering shows the impact isn’t consistent across borrower types. In Cluster 1, approved loans are loss-making under both policies and expanding approvals under Policy B increases total losses (from about -£1.16m to -£2.02m). In contrast, Clusters 2, 3 and 4 are profitable segments, and Policy B increases total profit in all three clusters due to higher approvals while keeping mean realised profit per approved loan positive. This shows why clustering adds value beyond overall results: it highlights that the same policy change can destroy value in the high-risk cluster even while it increases value in the mainstream and mid-risk clusters.
+
+***
+
+***
+#Policy A vs Policy B: Cluster-level differences
+
+```{r}
+# Side-by-side comparison (Policy A vs Policy B) for each cluster, then calculates the uplift from A to B
+policy_diff_cluster <- policy_by_cluster %>%
+  select(cluster, policy, n_approved, approval_rate,
+         mean_profit_approved, total_profit_approved) %>%
+  pivot_wider(
+    names_from = policy,
+    values_from = c(n_approved, approval_rate, mean_profit_approved, total_profit_approved)
+  ) %>%
+  mutate(
+    delta_approval_rate = approval_rate_policy_b - approval_rate_policy_a,
+    delta_mean_profit   = mean_profit_approved_policy_b - mean_profit_approved_policy_a,
+    delta_total_profit  = total_profit_approved_policy_b - total_profit_approved_policy_a
+  ) %>%
+  arrange(cluster)
+
+policy_diff_cluster
+```
+This table compares Policy B vs Policy A by cluster, showing approval uplift and profit impact. Policy B approves more loans in every cluster, but the value of those extra approvals varies by borrower type. In Cluster 1, approved loans remain loss-making on average, so expanding approvals under Policy B makes total realised profit more negative. In Clusters 2–4, Policy B increases approvals and also raises mean profit per approved loan, so total profit increases strongly. This is the key added insight from clustering: the same policy change creates value in some segments but destroys value in others.
+
+***
+
+***
+# Bad-loan rate among approved borrowers (by cluster + policy)
+
+```{r}
+# Calculate the bad-loan rate only within the loans each policy would approve, split by cluster.
+bad_rate_by_cluster <- df_q2c %>%
+  pivot_longer(c(policy_a, policy_b),
+               names_to = "policy",
+               values_to = "approved") %>%
+  group_by(cluster, policy) %>%
+  summarise(
+    bad_rate_approved = mean(loan_is_bad[approved], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(cluster, policy)
+
+bad_rate_by_cluster
+```
+
+```{r}
+# Visual for  Bad-loan rate among approved loans by cluster and policy
+
+
+policy_plot_risk <- bad_rate_by_cluster %>%
+  mutate(
+    cluster = factor(cluster, levels = c("1","2","3","4")),
+    policy = dplyr::case_when(
+      policy == "policy_a" ~ "Policy A",
+      policy == "policy_b" ~ "Policy B",
+      TRUE ~ as.character(policy)
+    )
+  )
+   
+ggplot(policy_plot_risk, aes(x = cluster, y = bad_rate_approved, fill = policy)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Bad-loan rate among approved loans by cluster",
+    x = "Cluster",
+    y = "Bad-loan rate",
+    fill = "Policy"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+This table compares the bad-loan rate among the loans each policy would approve, split by cluster. Policy B has a higher bad rate in every cluster because it is less strict and includes riskier borrowers. The biggest increases are in Cluster 1 and Cluster 4, meaning the extra approvals under Policy B in these segments come with noticeably higher risk. Cluster 2 stays the lowest-risk segment under both policies, even though its bad rate still rises under Policy B.
+
+***
+
+***
+# Cluster-level impact when switching Policy A to B
+
+```{r}
+# Summarise the best/worst change across clusters
+cluster_insight_summary <- policy_diff_cluster %>%
+  summarise(
+    min_delta_total_profit = min(delta_total_profit, na.rm = TRUE),
+    max_delta_total_profit = max(delta_total_profit, na.rm = TRUE),
+    min_delta_mean_profit  = min(delta_mean_profit, na.rm = TRUE),
+    max_delta_mean_profit  = max(delta_mean_profit, na.rm = TRUE)
+  )
+
+cluster_insight_summary
+```
+Cluster 2 is the big winner under Policy B. Total realised profit increases from £16.68m under Policy A to £26.44m under Policy B, so Policy B adds about £9.76m in this cluster alone. This is also the largest cluster, so it’s the main driver of the overall uplift.
+
+Cluster 1 is the problem cluster under Policy B. Profit is negative under both policies, but it gets worse when you switch to Policy B: total realised profit drops from -£1.16m (Policy A) to -£2.02m (Policy B), so Policy B destroys about £0.86m in this segment. Even though the mean profit per approved loan improves by about £524 here (from -£1,009 to -£485), it’s still negative on average, and approving more loans in this cluster scales losses.
+
+Clusters 3 and 4 both improve under Policy B, but they are secondary contributors compared to Cluster 2. Cluster 3 increases total realised profit from £2.72m to £6.16m, an uplift of about £3.44m. Cluster 4 increases total realised profit from £2.43m to £5.62m, an uplift of about £3.19m.
+
+So analytically, Policy B “wins” because it massively outperforms in Cluster 2 and also improves Clusters 3 and 4, but it clearly underperforms in Cluster 1 and creates a material profit drag there. The extra insight from clustering is that the policy impact is not uniform: Policy B is being carried by Cluster 2, while Cluster 1 is a clear segment where expanding approvals damages profit.
+
+```{r}
+# Export cluster labels
+cluster_export <- data[keep_complete, ] %>%
+  slice(which(keep_outliers)) %>%
+  select(member_id) %>%
+  mutate(cluster = km_final$cluster)
+
+write.csv(cluster_export, "cluster_labels.csv", row.names = FALSE)
+cat("Cluster labels exported:", nrow(cluster_export), "rows\n")
+```
+
+
+***

@@ -1,0 +1,217 @@
+---
+title: "Q1 - A/B Testing"
+author: "Group-2"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(broom)
+library(effectsize)
+library(dplyr)
+library(knitr)
+```
+
+### Load Data
+```{r}
+df <- read_csv("early_2012_2013_loan_sample_with_outcome.csv",
+               show_col_types = FALSE)
+```
+
+```{r}
+# Convert to factors
+df <- df %>%
+  mutate(
+    grade       = factor(grade),
+    loan_is_bad = as.logical(loan_is_bad)
+  )
+```
+
+### Data Quality Check
+```{r}
+# Null value check
+key_vars <- c("grade",
+              "dti",
+              "loan_is_bad",
+              "loan_amnt",
+              "total_rec_prncp",
+              "total_rec_int",
+              "recoveries",
+              "collection_recovery_fee")
+
+df %>%
+  select(all_of(key_vars)) %>%
+  summarise_all(~ sum(is.na(.)))
+```
+
+### Policy Definition
+- Policy A – Grade A,B + DTI < 25  
+- Policy B – Grade A,B,C,D + DTI < 25
+```{r}
+
+df <- df %>%
+  mutate(
+    policy_a = grade %in% c('A', 'B') & dti < 25,
+    policy_b = grade %in% c('A', 'B', 'C', 'D') & dti < 25
+  )
+```
+
+### Primary OEC -  Mean Realised Profit
+```{r}
+df <- df %>%
+  mutate(
+    realised_profit =
+      total_rec_prncp +
+      total_rec_int +
+      total_rec_late_fee +
+      recoveries -
+      collection_recovery_fee -
+      funded_amnt
+  )
+```
+
+```{r}
+#Policy-Level Dataset (Approved Loans Only)
+policy_long <- df %>%
+  select(realised_profit, loan_is_bad, policy_a, policy_b) %>%
+  pivot_longer(cols = c(policy_a, policy_b),
+               names_to = "Policy",
+               values_to = "Approved") %>%
+  filter(Approved == TRUE) %>%
+  mutate(Policy = factor(Policy))
+```
+
+```{r}
+#Policy Comparison
+profit_summary <- policy_long %>%
+  group_by(Policy) %>%
+  summarise(
+    mean_profit = mean(realised_profit),
+    sd_profit = sd(realised_profit),
+    n_loans = n(),
+    se = sd_profit / sqrt(n_loans),
+    lower_ci = mean_profit - 1.96 * se,
+    upper_ci = mean_profit + 1.96 * se,
+    total_profit = sum(realised_profit)
+  )
+
+print(profit_summary)
+```
+
+
+```{r}
+# H0: Mean realised profit under Policy A equals Policy B
+# H1: Mean realised profit differs between policies
+
+profit_ttest <- t.test(
+  realised_profit ~ Policy,
+  data = policy_long,
+  var.equal = FALSE
+)
+
+print(profit_ttest)
+```
+The mean realised profit per approved loan under Policy A was £946.07 compared to £981.82 under Policy B. A Welch two-sample t-test indicates that this difference is not statistically significant (t = −1.35, p = 0.178). The 95% confidence interval [−87.68, 16.18] includes zero, suggesting insufficient evidence that expanding approvals to Grades C and D increases profitability per loan. Therefore, from a statistical perspective, the two policies generate comparable average profitability.
+
+```{r}
+#Effect Size (Cohen’s d)
+
+A_vals <- policy_long$realised_profit[
+  policy_long$Policy == "policy_a"]
+
+B_vals <- policy_long$realised_profit[
+  policy_long$Policy == "policy_b"]
+
+cohens_d_result <- cohens_d(A_vals, B_vals)
+
+print(cohens_d_result)
+```
+The effect size associated with the difference in mean realised profit between Policy A and Policy B is negligible (Cohen’s d = −0.01, 95% CI [−0.03, 0.01]). This indicates that the expanded approval criteria do not generate a practically meaningful increase in profitability per loan. Combined with the substantially higher default rate under Policy B, the additional risk taken does not appear to be compensated by higher returns.
+
+### Secondary OEC – Default Rate
+```{r}
+# Policy A
+approved_A <- sum(df$policy_a)
+bad_approved_A <- sum(df$policy_a & df$loan_is_bad)
+default_rate_A <- bad_approved_A / approved_A
+
+# Policy B
+approved_B <- sum(df$policy_b)
+bad_approved_B <- sum(df$policy_b & df$loan_is_bad)
+default_rate_B <- bad_approved_B / approved_B
+
+default_summary <- tibble(
+  Policy = c("Policy A", "Policy B"),
+  Approved = c(approved_A, approved_B),
+  Bad_Approved = c(bad_approved_A, bad_approved_B),
+  Default_Rate = c(default_rate_A, default_rate_B)
+)
+
+print(default_summary)
+```
+
+```{r}
+# H0: Default rate under Policy A equals Policy B
+# H1: Default rate differs between policies
+
+default_test <- prop.test(
+  x = c(bad_approved_A, bad_approved_B),
+  n = c(approved_A, approved_B),
+  correct = FALSE
+)
+
+print(default_test)
+```
+The default rate under Policy A is 9.71%, compared to 13.51% under Policy B. A two-sample test for equality of proportions indicates that this difference is highly statistically significant (χ² = 189.37, p < 0.001). The 95% confidence interval [−4.33%, −3.28%] confirms that Policy A substantially reduces default risk. In contrast, the difference in mean realised profit per loan between policies is not statistically or practically significant. Therefore, expanding approvals to include Grades C and D increases credit risk without delivering higher per-loan profitability.
+
+```{r}
+# Profit per £ Lent
+
+profit_ratio <- tibble(
+  ratio_A = sum(df$realised_profit[df$policy_a]) /
+            sum(df$loan_amnt[df$policy_a]),
+  ratio_B = sum(df$realised_profit[df$policy_b]) /
+            sum(df$loan_amnt[df$policy_b])
+)
+```
+
+```{r}
+#Final Comparison Table
+
+final_summary <- tibble(
+  Metric = c("Mean Profit",
+             "Default Rate",
+             "Approval Rate",
+             "Profit per £"),
+  Policy_A = c(
+    mean(df$realised_profit[df$policy_a]),
+    default_rate_A,
+    mean(df$policy_a),
+    profit_ratio$ratio_A
+  ),
+  Policy_B = c(
+    mean(df$realised_profit[df$policy_b]),
+    default_rate_B,
+    mean(df$policy_b),
+    profit_ratio$ratio_B
+  )
+)
+
+print(final_summary)
+```
+This analysis compared two alternative loan approval strategies using a simulated A/B testing framework. Policy A represents a conservative underwriting strategy, approving only borrowers with credit grades A–B and debt-to-income ratios below 25%. Policy B expands approval to include grades C–D while maintaining the same DTI threshold. The objective was to evaluate which policy better satisfies the firm’s strategic goal of minimising default losses while maintaining profitability.
+
+The primary evaluation metric was mean realised profit per approved loan, defined as net cash inflows (principal repaid, interest received, and recoveries) minus the original loan amount and collection costs. A Welch two-sample t-test indicated no statistically significant difference in mean profit between the two policies (p = 0.178). The estimated effect size was negligible (Cohen’s d = −0.01), and the 95% confidence interval for the difference included zero. These results suggest that expanding approvals to include lower-grade borrowers does not meaningfully increase profitability per loan.
+
+As a secondary risk metric, default rate was analysed to assess differences in credit risk exposure. Policy A exhibited a default rate of 9.7%, compared to 13.5% under Policy B. A two-sample test for equality of proportions confirmed that this difference is highly statistically significant (p < 0.001), with a confidence interval indicating a reduction of approximately 3–4 percentage points under Policy A. This represents a substantial relative reduction in default risk.
+
+Taken together, the findings indicate that while both policies generate comparable average profitability, Policy B materially increases default exposure without delivering higher per-loan returns. Therefore, given the firm’s objective of minimising default losses while maintaining profitability, Policy A better aligns with the company’s strategic priorities. The stricter approval criteria reduce downside risk without sacrificing expected returns, resulting in a more efficient risk–return trade-off.
